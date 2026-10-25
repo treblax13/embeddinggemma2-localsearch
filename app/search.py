@@ -30,10 +30,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-HERE = Path(__file__).resolve().parent
-os.environ.setdefault("HF_HOME", str(HERE / ".cache-hf"))  # keep the model next to the app
+def _data_dir() -> Path:
+    """Where the model cache and the index cache are written.
+
+    A PyInstaller .app's own folder is a read-only, code-signed bundle — writing the
+    downloaded model or an index there would fail (or break the signature). Packaged
+    builds get a normal per-user data folder instead; running from source keeps using
+    the folder next to this script, unchanged.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path.home() / "Library" / "Application Support" / "EmbeddingGemma2LocalSearch"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    return Path(__file__).resolve().parent
+
+
+HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # bundled resources (read-only)
+DATA = _data_dir()  # model cache, index cache (writable)
+os.environ.setdefault("HF_HOME", str(DATA / ".cache-hf"))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-INDEXES = HERE / "indexes"
+INDEXES = DATA / "indexes"
 WEB = HERE / "web"
 MODEL_ID = "google/embeddinggemma-2"
 
@@ -71,7 +87,10 @@ class Model:
             from sentence_transformers import SentenceTransformer
 
             device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            kw = dict(device=device, config_kwargs={"audio_config": None})  # text + image encoders only
+            # text + image encoders only. Note: the model's AutoProcessor still loads a
+            # video sub-processor (and needs torchvision for it) regardless of this
+            # video_config override — torchvision must stay a real dependency (see search.spec).
+            kw = dict(device=device, config_kwargs={"audio_config": None, "video_config": None})
             try:
                 # Already downloaded? Then don't even try to reach the network.
                 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -143,6 +162,13 @@ def chunk_text(text: str) -> list[str]:
 
 def is_screenshot(name: str) -> bool:
     return name.lower().startswith(("screenshot", "screen shot", "captura"))
+
+
+def category_of(rel: str) -> str | None:
+    """Top-level folder of a file's path relative to the indexed root, e.g. 'Proyectos'
+    for 'Proyectos/unidad1/plan.pdf'. None for files directly in the indexed folder."""
+    parts = rel.replace("\\", "/").split("/")
+    return parts[0] if len(parts) > 1 else None
 
 
 def find_files(folder: Path) -> list[Path]:
@@ -231,7 +257,13 @@ class Index:
     def summary(self) -> dict | None:
         if self.folder is None:
             return None
-        return {"folder": str(self.folder), "name": self.folder.name, "stats": self.stats}
+        return {"folder": str(self.folder), "name": self.folder.name, "stats": self.stats,
+                "categories": self.categories("pdf")}
+
+    def categories(self, kind: str) -> list[str]:
+        """Distinct top-level folders among items of this type, e.g. ['Contenidos Disciplinares',
+        'Multiples Lenguajes', 'Proyectos']. Powers the "by category" grouped search."""
+        return sorted({it["category"] for it in self.items if it["type"] == kind and it.get("category")})
 
     # ---------------------------------------------------------- build
 
@@ -294,7 +326,9 @@ class Index:
                 for it, its_rows in prev:
                     k = len(items)
                     shutil.copyfile(d / "thumbs" / it["thumb"], thumbs / f"{k:05d}.jpg")
-                    items.append({**it, "path": str(f), "thumb": f"{k:05d}.jpg"})
+                    # Recomputed, not copied from `it`: an index from before the "category"
+                    # field existed must not keep that field missing forever.
+                    items.append({**it, "path": str(f), "thumb": f"{k:05d}.jpg", "category": category_of(rel(f))})
                     for row, vector in its_rows:
                         reused_rows.append({**row, "item": k})
                         reused_vectors.append(vector)
@@ -318,7 +352,7 @@ class Index:
                     print(f"skipping {f}: {e}", file=sys.stderr)
                     continue
                 items.append({"type": "screenshot" if is_screenshot(f.name) else "photo",
-                              "path": str(f), "rel": rel(f), "name": f.name,
+                              "path": str(f), "rel": rel(f), "name": f.name, "category": category_of(rel(f)),
                               "thumb": copy.name, "width": width, "height": height, **s})
                 pending_images.append((k, str(copy)))
                 p["images"] += 1
@@ -345,6 +379,7 @@ class Index:
                         Image.frombytes("RGB", (pix.width, pix.height), pix.samples).save(copy, "JPEG", quality=86)
                         text = page.get_text()
                         items.append({"type": "pdf", "path": str(f), "rel": rel(f), "name": f.name,
+                                      "category": category_of(rel(f)),
                                       "page": n, "pages": doc.page_count, "thumb": copy.name,
                                       "width": pix.width, "height": pix.height,
                                       "has_text": len(text.strip()) > 25, **s})
@@ -406,12 +441,14 @@ class Index:
 
     # ---------------------------------------------------------- search
 
-    def rank(self, q, n: int, kind: str = "all", exclude: int | None = None, text: str = "") -> list[dict]:
-        """Ranks items by similarity to the query vector q.
+    def _score(self, q, text: str, exclude: int | None):
+        """Similarity of every row to q, standardised per modality, plus the best row
+        (and best text row, for the snippet) of each item. Shared by rank() and
+        rank_by_category().
 
         Text↔text and text↔image similarities live on different scales (the
         "modality gap"), so each modality is standardised on its own (z-score)
-        before mixing them. Each item keeps its best-scoring row.
+        before mixing them.
 
         Embeddings are vague about exact codes (invoice numbers, plates, IDs), so
         text chunks containing a code from the query `text` verbatim get CODE_BOOST.
@@ -442,20 +479,48 @@ class Index:
                 best[it] = (float(z[i]), i)
             if r["kind"] == "text" and (it not in best_text or sims[i] > sims[best_text[it]]):
                 best_text[it] = i
+        return sims, best, best_text
+
+    def _format(self, it: int, sims, best, best_text) -> dict:
+        score, row = best[it]
+        return {
+            "id": it, **{k: v for k, v in self.items[it].items() if k != "path"},
+            "matched_by": self.rows[row]["kind"], "z": round(score, 2),
+            "snippet": self.rows[best_text[it]]["text"] if it in best_text else "",
+            "similarity": round(float(sims[row]), 3),
+        }
+
+    @staticmethod
+    def _top(best: dict[int, tuple[float, int]], candidates, n: int) -> list[int]:
+        return sorted(candidates, key=lambda it: -best[it][0])[:n]
+
+    def rank(self, q, n: int, kind: str = "all", exclude: int | None = None, text: str = "") -> list[dict]:
+        """Ranks items by similarity to the query vector q. Each item keeps its best-scoring row."""
+        sims, best, best_text = self._score(q, text, exclude)
 
         def keep(it: int) -> bool:
             return kind == "all" or self.items[it]["type"] == kind
 
-        order = sorted((it for it in best if keep(it)), key=lambda it: -best[it][0])[:n]
-        out = []
-        for it in order:
-            score, row = best[it]
-            out.append({
-                "id": it, **{k: v for k, v in self.items[it].items() if k != "path"},
-                "matched_by": self.rows[row]["kind"], "z": round(score, 2),
-                "snippet": self.rows[best_text[it]]["text"] if it in best_text else "",
-                "similarity": round(float(sims[row]), 3),
-            })
+        order = self._top(best, (it for it in best if keep(it)), n)
+        return [self._format(it, sims, best, best_text) for it in order]
+
+    def rank_by_category(self, q, n: int, kind: str, text: str = "") -> dict[str, list[dict]]:
+        """Like rank(), but ranks each category of `kind` separately and keeps the top n of
+        each — so one category (e.g. a huge "Proyectos" folder) can't bury the other two
+        in a single merged ranking. Categories come from categories(), alphabetically; items
+        of `kind` with no category (directly in the indexed root) land in "Uncategorized"."""
+        sims, best, best_text = self._score(q, text, None)
+
+        def of(it: int, cat: str | None) -> bool:
+            return self.items[it]["type"] == kind and self.items[it].get("category") == cat
+
+        out: dict[str, list[dict]] = {}
+        for cat in self.categories(kind):
+            order = self._top(best, (it for it in best if of(it, cat)), n)
+            out[cat] = [self._format(it, sims, best, best_text) for it in order]
+        uncategorized = self._top(best, (it for it in best if of(it, None)), n)
+        if uncategorized:
+            out["Uncategorized"] = [self._format(it, sims, best, best_text) for it in uncategorized]
         return out
 
     def image_vector(self, item: int):
@@ -628,6 +693,13 @@ def make_handler(model: Model, index: Index):
                     v = model.embed_query(q.get("q", ""))
                     res = index.rank(v, int(q.get("n", 24)), q.get("type", "all"), text=q.get("q", ""))
                     return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
+                if u.path == "/search-grouped":
+                    if not self._can_search():
+                        return
+                    t0 = time.perf_counter()
+                    v = model.embed_query(q.get("q", ""))
+                    res = index.rank_by_category(v, int(q.get("n", 8)), q.get("type", "pdf"), text=q.get("q", ""))
+                    return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
                 if u.path == "/similar":
                     if not self._can_search():
                         return
@@ -698,8 +770,13 @@ def make_handler(model: Model, index: Index):
     return Handler
 
 
-def open_window(url: str) -> None:
-    """Opens the UI as an app window (Chrome/Edge --app mode) or in the default browser."""
+def open_window(url: str) -> subprocess.Popen | None:
+    """Opens the UI as an app window (Chrome/Edge --app mode) or in the default browser.
+
+    Returns the window's process, or None if it fell back to the default browser (no
+    process of ours to watch). The caller quits the whole app once this process exits,
+    so closing the window is what closing "the app" means.
+    """
     import shutil
     import webbrowser
 
@@ -711,17 +788,19 @@ def open_window(url: str) -> None:
     ]
     for c in candidates:
         if c and Path(c).exists():
-            subprocess.Popen([c, f"--app={url}", "--window-size=1440,900", f"--user-data-dir={HERE / '.chrome-app'}"],
+            return subprocess.Popen([c, f"--app={url}", "--window-size=1440,900", f"--user-data-dir={DATA / '.chrome-app'}"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
     webbrowser.open(url)
+    return None
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Local semantic search over photos and PDFs with EmbeddingGemma 2.")
     ap.add_argument("--port", type=int, default=8765, help="port for the local web UI (default 8765)")
     ap.add_argument("--no-window", action="store_true", help="only start the server, don't open a window")
-    args = ap.parse_args()
+    # parse_known_args: a double-clicked .app can be launched with extra macOS/Launch
+    # Services arguments (e.g. a process serial number) that this parser doesn't define.
+    args, _ = ap.parse_known_args()
 
     INDEXES.mkdir(exist_ok=True)
     model = Model()
@@ -730,12 +809,33 @@ def main() -> None:
     if last.exists():
         index.load(Path(last.read_text(encoding="utf-8").strip()))
 
-    # Bound to 127.0.0.1 only: not reachable from other machines on the network.
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(model, index))
-    url = f"http://127.0.0.1:{args.port}"
+    # Bound to 127.0.0.1 only: not reachable from other machines on the network. If the
+    # requested port is already taken by something else, try the next few: a double-clicked
+    # .app has no console to show a bind error on, so failing outright would look like the
+    # app just didn't open.
+    handler = make_handler(model, index)
+    port, server = args.port, None
+    for port in range(args.port, args.port + 20):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise SystemExit(f"Could not find a free port starting at {args.port}")
+    url = f"http://127.0.0.1:{port}"
     print(f"EmbeddingGemma 2 Local Search running at {url}  (Ctrl+C to stop)", flush=True)
-    if not args.no_window:
-        open_window(url)
+    window = None if args.no_window else open_window(url)
+    if window is not None:
+        # Nothing else ties this process's lifetime to the window: without this, closing
+        # the window leaves the server (and the port) running forever in the background,
+        # so the next launch finds the app "already running" with no window to show for
+        # it and just hangs. Closing the window is what closing "the app" means.
+        def _quit_when_window_closes() -> None:
+            window.wait()
+            os._exit(0)
+
+        threading.Thread(target=_quit_when_window_closes, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -743,4 +843,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Packaged builds have no separate python.exe: a multiprocessing child (torch/MPS
+    # spawns a resource_tracker) re-invokes this same frozen executable. Without
+    # freeze_support() as the very first call, that re-invocation doesn't recognize
+    # itself as a multiprocessing worker and falls through to running the whole app
+    # again — which spawns its own worker, which spawns its own, forever.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     main()

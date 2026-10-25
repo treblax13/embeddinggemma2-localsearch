@@ -3,8 +3,12 @@ app/.venv/
 app/.cache-hf/
 app/.chrome-app/
 app/indexes/
+# PyInstaller build output (the packaged .app, ~1GB)
+app/build/
+app/dist/
 __pycache__/
 *.pyc
 .DS_Store
 # local scratch material
 _trabajo/
+/Ts-pdf/

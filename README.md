@@ -126,6 +126,19 @@ For an NVIDIA GPU, install the CUDA build of PyTorch first (see [pytorch.org](ht
 
 The web UI is a single HTML file with no build step and no external requests.
 
+### Building a standalone macOS app
+
+For running this on a machine with no Python/venv setup: `app/search.spec` packages `search.py` with PyInstaller into a double-clickable `.app` that bundles Python, torch and the other dependencies.
+
+```bash
+cd app
+source .venv/bin/activate
+pip install pyinstaller pyinstaller-hooks-contrib
+pyinstaller search.spec --noconfirm
+```
+
+The result is `app/dist/EmbeddingGemma2LocalSearch.app` (~1 GB). It still downloads the model on first run (same as running from source) and still needs internet for that one time; after that it's offline like any other install. Unlike running from source, it stores the model cache and your indexes under `~/Library/Application Support/EmbeddingGemma2LocalSearch/` instead of next to the script, since a packaged `.app`'s own folder is read-only.
+
 ---
 
 ## Using the app

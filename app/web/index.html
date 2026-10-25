@@ -74,6 +74,11 @@ button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}
 .query-image img{width:56px;height:56px;object-fit:cover;border-radius:10px;border:1px solid var(--border)}
 
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:18px;padding:18px 32px 60px;max-width:1600px;margin:0 auto}
+.categories{display:flex;flex-direction:column;gap:38px;padding:18px 32px 60px;max-width:1600px;margin:0 auto}
+.cat-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px}
+.cat-head h2{margin:0;font-size:18px;letter-spacing:-.01em}
+.cat-head span{color:var(--faint);font-size:13.5px}
+.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
 .card{background:var(--layer);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s;animation:enter .35s both;display:flex;flex-direction:column}
 .card:hover{transform:translateY(-3px);border-color:#3c3e47}
 .card.first{border-color:#6f8cff;box-shadow:0 0 0 1px #6f8cff,0 14px 50px #6f8cff30}
@@ -194,10 +199,12 @@ body.scores .name .sim{display:inline}
       <button class="chip" data-type="photo">Photos</button>
       <button class="chip" data-type="screenshot">Screenshots</button>
       <button class="chip" data-type="pdf">PDFs</button>
+      <button class="chip hidden" id="chipGroup" title="Rank each category on its own, so one doesn't bury the others">By category</button>
       <span class="info" id="info"></span>
     </div>
   </div>
   <main class="grid" id="grid"></main>
+  <main class="categories hidden" id="categories"></main>
 </section>
 
 <div class="veil hidden" id="veil">
@@ -223,7 +230,7 @@ body.scores .name .sim{display:inline}
 <script>
 const $ = s => document.querySelector(s);
 const views = {start: $('#viewStart'), index: $('#viewIndex'), search: $('#viewSearch')};
-let status = {}, type = 'all', last = null, pendingFolder = null, results = [], opened = null;
+let status = {}, type = 'all', groupBy = false, last = null, pendingFolder = null, results = [], resultsById = {}, opened = null;
 
 function show(name){ for (const k in views) views[k].classList.toggle('hidden', k !== name); }
 const fmtTime = s => s < 60 ? `${Math.round(s)} s` : `${Math.floor(s/60)} min ${String(Math.round(s%60)).padStart(2,'0')} s`;
@@ -257,6 +264,11 @@ async function poll(){
   const bc = $('#btnContinue');
   bc.classList.toggle('hidden', !ix);
   if (ix) bc.textContent = `Continue with “${ix.name}”`;
+
+  // "By category" only makes sense once PDFs are split across 2+ top-level folders.
+  const hasCategories = !!(ix && ix.categories && ix.categories.length > 1);
+  $('#chipGroup').classList.toggle('hidden', !hasCategories);
+  if (!hasCategories && groupBy) setGroupBy(false);
 }
 
 function paintProgress(p){
@@ -318,7 +330,8 @@ function search(){
   if (!q) return;
   $('#queryImage').classList.add('hidden');
   last = {mode:'text', q};
-  run(`/search?q=${encodeURIComponent(q)}&type=${type}&n=24`);
+  if (groupBy) runGrouped(`/search-grouped?q=${encodeURIComponent(q)}&n=8`);
+  else run(`/search?q=${encodeURIComponent(q)}&type=${type}&n=24`);
 }
 async function run(url, opts){
   $('#info').textContent = 'Searching…';
@@ -329,6 +342,25 @@ async function run(url, opts){
     $('#info').textContent = `${d.results.length} results · ${d.ms} ms`;
   } catch(e){ $('#info').textContent = e.message; }
 }
+async function runGrouped(url){
+  $('#info').textContent = 'Searching…';
+  try {
+    const d = await api(url);
+    results = Object.values(d.results).flat();
+    paintGrouped(d.results);
+    const cats = Object.keys(d.results).length;
+    $('#info').textContent = `${results.length} results across ${cats} categories · ${d.ms} ms`;
+  } catch(e){ $('#info').textContent = e.message; }
+}
+function setGroupBy(on){
+  groupBy = on;
+  $('#chipGroup').classList.toggle('on', groupBy);
+  $('#grid').classList.toggle('hidden', groupBy);
+  $('#categories').classList.toggle('hidden', !groupBy);
+  document.querySelectorAll('.chip[data-type]').forEach(c => c.classList.toggle('hidden', groupBy));
+  if (last && last.mode === 'text') search();
+}
+$('#chipGroup').onclick = () => setGroupBy(!groupBy);
 function highlight(text){
   if (!last || last.mode !== 'text') return esc(text);
   const words = queryWords();
@@ -361,24 +393,48 @@ function tags(r){
   if (r.type === 'screenshot') return `<span class="t-screenshot">SCREENSHOT</span>`;
   return `<span class="t-photo">PHOTO</span>`;
 }
-function paint(list){
-  const g = $('#grid');
-  if (!list.length){ g.innerHTML = '<div class="empty">Nothing here</div>'; return; }
-  g.innerHTML = list.map((r,k) => `
-    <article class="card ${r.type} ${k===0?'first':''}" data-k="${k}" style="animation-delay:${Math.min(k,12)*25}ms">
+function cardHTML(r, k){
+  return `
+    <article class="card ${r.type} ${k===0?'first':''}" data-id="${r.id}" style="animation-delay:${Math.min(k,12)*25}ms">
       <div class="thumb"><img src="/thumb/${r.id}" loading="lazy" alt=""><div class="tags">${tags(r)}</div></div>
       <div class="foot">
         <div class="name"><span>${esc(r.name)}</span><span class="sim">${r.similarity.toFixed(2)}</span></div>
         ${r.snippet ? `<div class="snippet">${highlight(excerpt(r.snippet))}</div>` : ''}
         <div class="via">${r.matched_by === 'text' ? 'Matched by its text' : 'Matched by how it looks'}</div>
       </div>
-    </article>`).join('');
-  g.querySelectorAll('.card').forEach(c => c.onclick = () => openViewer(results[+c.dataset.k]));
+    </article>`;
+}
+function bindCards(root){
+  root.querySelectorAll('.card').forEach(c => c.onclick = () => openViewer(resultsById[c.dataset.id]));
+}
+function paint(list){
+  const g = $('#grid');
+  resultsById = {};
+  if (!list.length){ g.innerHTML = '<div class="empty">Nothing here</div>'; return; }
+  list.forEach(r => resultsById[r.id] = r);
+  g.innerHTML = list.map((r,k) => cardHTML(r,k)).join('');
+  bindCards(g);
+}
+function paintGrouped(byCategory){
+  const g = $('#categories');
+  resultsById = {};
+  const cats = Object.keys(byCategory);
+  if (!cats.some(c => byCategory[c].length)){ g.innerHTML = '<div class="empty">Nothing here</div>'; return; }
+  g.innerHTML = cats.map(cat => {
+    const list = byCategory[cat];
+    list.forEach(r => resultsById[r.id] = r);
+    return `
+      <section>
+        <div class="cat-head"><h2>${esc(cat)}</h2><span>${list.length} match${list.length === 1 ? '' : 'es'}</span></div>
+        <div class="cat-grid">${list.length ? list.map((r,k) => cardHTML(r,k)).join('') : '<span class="info">No matches</span>'}</div>
+      </section>`;
+  }).join('');
+  bindCards(g);
 }
 
 $('#form').onsubmit = e => { e.preventDefault(); search(); };
-document.querySelectorAll('.chip').forEach(c => c.onclick = () => {
-  document.querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === c));
+document.querySelectorAll('.chip[data-type]').forEach(c => c.onclick = () => {
+  document.querySelectorAll('.chip[data-type]').forEach(x => x.classList.toggle('on', x === c));
   type = c.dataset.type;
   if (!last) return;
   if (last.mode === 'text') search();
@@ -387,7 +443,18 @@ document.querySelectorAll('.chip').forEach(c => c.onclick = () => {
 });
 
 // ---------------- search with an image
+function exitGroupedMode(){
+  // "Find similar" and image search are single-ranking queries, not per-category ones:
+  // leave "By category" so results land in the visible #grid, not the hidden #categories.
+  if (!groupBy) return;
+  groupBy = false;
+  $('#chipGroup').classList.remove('on');
+  $('#grid').classList.remove('hidden');
+  $('#categories').classList.add('hidden');
+  document.querySelectorAll('.chip[data-type]').forEach(c => c.classList.remove('hidden'));
+}
 function searchWithImage(file){
+  exitGroupedMode();
   last = {mode:'image', file};
   $('#queryImage').classList.remove('hidden');
   $('#queryImageSrc').src = URL.createObjectURL(file);
@@ -396,6 +463,7 @@ function searchWithImage(file){
   run(`/search-image?type=${type}`, {method:'POST', body: file});
 }
 function similar(id, name){
+  exitGroupedMode();
   last = {mode:'similar', id, name};
   $('#queryImage').classList.remove('hidden');
   $('#queryImageSrc').src = `/thumb/${id}`;
